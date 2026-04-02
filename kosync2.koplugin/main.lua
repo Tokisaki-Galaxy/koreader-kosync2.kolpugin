@@ -1037,7 +1037,7 @@ function KOSync2:onCloseWidget()
 end
 
 function KOSync2:getLoadedStatisticsPlugin()
-    if not self.ui then return nil end
+    if not self.ui or not self.ui.pluginloader then return nil end
     for _, plugin in ipairs(self.ui.pluginloader.plugins) do
         if plugin.name == "statistics" then
             return plugin
