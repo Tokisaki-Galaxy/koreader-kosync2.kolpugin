@@ -192,6 +192,7 @@ end
 function KOSync2:addToMainMenu(menu_items)
     menu_items.progress_sync2 = {
         text = _("Progress & Statistics sync"),
+        sorting_hint = "tools",
         sub_item_table = {
             {
                 text = _("Custom sync server"),
