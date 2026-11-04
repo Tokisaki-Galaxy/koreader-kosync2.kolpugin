@@ -19,6 +19,7 @@
 *   **Web Dashboard**: View your reading progress and habits through a modern web interface.
 *   **Server-Side Merging**: Uses intelligent logic to merge reading events from different devices, preventing data loss or overwrites common with file-based sync (like WebDAV).
 *   **E-ink Optimized**: Built with efficiency in mind. It uses lightweight JSON deltas instead of full database uploads to save battery and bandwidth.
+*   **Offline Retry Queue**: Failed progress pushes are kept on the device and replayed on the next connection instead of being lost when Wi-Fi is unavailable.
 *   **Non-Invasive Integration**: Utilizes `user-patching` to hook into the native "Reading Statistics" menu without modifying core KOReader files.
 
 ---
@@ -31,6 +32,16 @@
     *   **Android**: `/sdcard/koreader/plugins/`
     *   **Kindle/Kobo/PocketBook**: `koreader/plugins/`
 3.  Restart KOReader.
+
+### Coexistence with the built-in Progress sync
+
+KOReader ships a built-in **Progress sync** plugin. KOSync2 is a separate plugin and can coexist with it, but running both at the same time is not recommended:
+
+- Both plugins react to the same network and document-close events, which can duplicate sync traffic.
+- The built-in plugin registers the same gesture action names first, so bind gestures to the KOSync2 actions explicitly when both are enabled.
+- Pending retries are stored in a separate queue file, so progress queued for one account is never replayed into another.
+
+If you only use KOSync2, disable the built-in Progress sync in KOReader's Plugin management menu and restart KOReader.
 
 ### 2. Server Setup
 KOSync2 requires a compatible backend to store and merge your data. We recommend our **Serverless** implementation for zero-maintenance hosting:

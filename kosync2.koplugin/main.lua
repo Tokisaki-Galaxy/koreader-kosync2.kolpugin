@@ -19,12 +19,15 @@ local util = require("util")
 local T = require("ffi/util").template
 local _ = require("gettext")
 
+local KOSync2Queue = require("KOSync2Queue")
+
 local statistics_db_location = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
 
 local KOSync2 = WidgetContainer:extend{
     name = "kosync2",
     is_doc_only = true,
     title = _("Register/login to sync server"),
+    settings_key = "kosync2",
 
     push_timestamp = nil,
     pull_timestamp = nil,
@@ -50,6 +53,11 @@ local CHECKSUM_METHOD = {
 
 -- Debounce push/pull attempts
 local API_CALL_DEBOUNCE_DELAY = time.s(25)
+
+-- A queued progress snapshot older than the server's last write is stale. The
+-- tolerance absorbs small clock differences between the device and the server.
+local QUEUE_STALE_TOLERANCE = 5 * 60
+local COEXISTENCE_WARNED_KEY = "kosync2_coexist_warned"
 
 -- NOTE: This is used in a migration script by ui/data/onetime_migration,
 --       which is why it's public.
@@ -82,7 +90,7 @@ function KOSync2:init()
         self:updateProgress(false, false)
     end
 
-    self.settings = G_reader_settings:readSetting("kosync2", self.default_settings)
+    self.settings = G_reader_settings:readSetting(self.settings_key, self.default_settings)
     self.device_id = G_reader_settings:readSetting("device_id")
 
     -- Disable auto-sync if beforeWifiAction was reset to "prompt" behind our back...
@@ -165,13 +173,46 @@ local function validateUser(user, pass)
     end
 end
 
+function KOSync2:isBuiltinKOSyncEnabled()
+    local disabled = G_reader_settings:readSetting("plugins_disabled", {})
+    return not disabled["kosync"]
+end
+
+function KOSync2:maybeWarnAboutCoexistence()
+    if not self:isBuiltinKOSyncEnabled() then return end
+    if G_reader_settings:isTrue(COEXISTENCE_WARNED_KEY) then return end
+    G_reader_settings:saveSetting(COEXISTENCE_WARNED_KEY, true)
+    UIManager:scheduleIn(2, function()
+        UIManager:show(InfoMessage:new{
+            text = _("The built-in Progress sync plugin is also enabled. Running both plugins can duplicate sync traffic and make gesture actions ambiguous. Consider disabling one in Plugin management."),
+            timeout = 8,
+        })
+    end)
+end
+
 function KOSync2:onDispatcherRegisterActions()
-    Dispatcher:registerAction("kosync_set_autosync",
-        { category="string", event="KOSync2ToggleAutoSync", title=_("Set auto progress sync"), reader=true,
+    local v1_enabled = self:isBuiltinKOSyncEnabled()
+    local function title(base)
+        return v1_enabled and T(_("%1 (KOSync2)"), base) or base
+    end
+
+    Dispatcher:registerAction("kosync2_set_autosync",
+        { category="string", event="KOSync2ToggleAutoSync", title=title(_("Set auto progress sync")), reader=true,
         args={true, false}, toggle={_("on"), _("off")},})
-    Dispatcher:registerAction("kosync_toggle_autosync", { category="none", event="KOSync2ToggleAutoSync", title=_("Toggle auto progress sync"), reader=true,})
-    Dispatcher:registerAction("kosync_push_progress", { category="none", event="KOSync2PushProgress", title=_("Push progress from this device"), reader=true,})
-    Dispatcher:registerAction("kosync_pull_progress", { category="none", event="KOSync2PullProgress", title=_("Pull progress from other devices"), reader=true, separator=true,})
+    Dispatcher:registerAction("kosync2_toggle_autosync", { category="none", event="KOSync2ToggleAutoSync", title=title(_("Toggle auto progress sync")), reader=true,})
+    Dispatcher:registerAction("kosync2_push_progress", { category="none", event="KOSync2PushProgress", title=title(_("Push progress from this device")), reader=true,})
+    Dispatcher:registerAction("kosync2_pull_progress", { category="none", event="KOSync2PullProgress", title=title(_("Pull progress from other devices")), reader=true, separator=true,})
+
+    -- Keep old gesture bindings working when the built-in plugin is disabled.
+    -- When it is enabled, those IDs belong to it and must not be stolen.
+    if not v1_enabled then
+        Dispatcher:registerAction("kosync_set_autosync",
+            { category="string", event="KOSync2ToggleAutoSync", title=T(_("%1 (legacy)"), _("Set auto progress sync")), reader=true,
+            args={true, false}, toggle={_("on"), _("off")},})
+        Dispatcher:registerAction("kosync_toggle_autosync", { category="none", event="KOSync2ToggleAutoSync", title=T(_("%1 (legacy)"), _("Toggle auto progress sync")), reader=true,})
+        Dispatcher:registerAction("kosync_push_progress", { category="none", event="KOSync2PushProgress", title=T(_("%1 (legacy)"), _("Push progress from this device")), reader=true,})
+        Dispatcher:registerAction("kosync_pull_progress", { category="none", event="KOSync2PullProgress", title=T(_("%1 (legacy)"), _("Pull progress from other devices")), reader=true, separator=true,})
+    end
 end
 
 function KOSync2:onReaderReady()
@@ -185,6 +226,7 @@ function KOSync2:onReaderReady()
     --       Plus, if wifi_enable_action is set to prompt, that also avoids stacking three prompts on top of each other...
     self:registerEvents()
     self:onDispatcherRegisterActions()
+    self:maybeWarnAboutCoexistence()
 
     self.last_page = self.ui:getCurrentPage()
 end
@@ -570,6 +612,9 @@ function KOSync2:doRegister(username, password, menu)
             })
         end
     elseif status then
+        if self.settings.username and self.settings.username ~= username then
+            KOSync2Queue:clear()
+        end
         self.settings.username = username
         self.settings.userkey = userkey
         if menu then
@@ -609,6 +654,9 @@ function KOSync2:doLogin(username, password, menu)
         Device:setIgnoreInput(false)
         return
     elseif status then
+        if self.settings.username and self.settings.username ~= username then
+            KOSync2Queue:clear()
+        end
         self.settings.username = username
         self.settings.userkey = userkey
         if menu then
@@ -628,6 +676,8 @@ end
 function KOSync2:logout(menu)
     self.settings.userkey = nil
     self.settings.auto_sync = true
+    -- Never replay queued progress from the previous account.
+    KOSync2Queue:clear()
     if menu then
         menu:updateItems()
     end
@@ -707,6 +757,13 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
     local progress = self:getLastProgress()
     local percentage = self:getLastPercent()
     local chosen_device_name = self.settings.kosync_hostname or Device.model
+    local queue_item = {
+        document = doc_digest,
+        progress = progress,
+        percentage = percentage,
+        device = chosen_device_name,
+        device_id = self.device_id,
+    }
     local ok, err = pcall(client.update_progress,
         client,
         self.settings.username,
@@ -716,23 +773,33 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         percentage,
         chosen_device_name,
         self.device_id,
-        function(ok, body)
+        function(ok, status, body)
             logger.dbg("KOSync2: [Push] progress to", percentage * 100, "% =>", progress, "for", self.view.document.file)
-            logger.dbg("KOSync2: ok:", ok, "body:", body)
-            if interactive then
-                if ok then
+            logger.dbg("KOSync2: ok:", ok, "status:", status, "body:", body)
+            if ok then
+                -- A successful push supersedes any older queued snapshot.
+                KOSync2Queue:removeDocument(doc_digest)
+                if interactive then
                     UIManager:show(InfoMessage:new{
                         text = _("Progress has been pushed."),
                         timeout = 3,
                     })
-                else
-                    showSyncError()
                 end
+            else
+                -- Do not retry auth failures: the credentials are the problem.
+                if status ~= 401 and doc_digest then
+                    KOSync2Queue:push(queue_item)
+                end
+                if interactive then showSyncError() end
             end
         end)
     if not ok then
         if interactive then showSyncError() end
         if err then logger.dbg("err:", err) end
+        -- Network unreachable: queue for retry.
+        if doc_digest then
+            KOSync2Queue:push(queue_item)
+        end
     else
         -- This is solely for onSuspend's sake, to clear the ghosting left by the "Connected" InfoMessage
         if on_suspend then
@@ -896,12 +963,8 @@ function KOSync2:_onCloseDocument()
     --       and we handle those system focus events via... Suspend & Resume events, so we need to neuter those handlers early.
     self.onResume = nil
     self.onSuspend = nil
-    -- NOTE: Because we'll lose the document instance on return, we need to *block* until the connection is actually up here,
-    --       we cannot rely on willRerunWhenOnline, because if we're not currently online,
-    --       it *will* return early, and that means the actual callback *will* run *after* teardown of the document instance
-    --       (and quite likely ours, too).
-    NetworkMgr:goOnlineToRun(function()
-        -- Drop the inner willRerunWhenOnline ;).
+
+    if NetworkMgr:isOnline() then
         if self.settings.auto_sync then
             self:updateProgress(false, false)
         end
@@ -909,7 +972,25 @@ function KOSync2:_onCloseDocument()
         if self.settings.auto_sync_stats then
             self:syncStatistics()
         end
-    end)
+        return
+    end
+
+    -- Offline: never block waiting for Wi-Fi while the document is being torn
+    -- down. Queue the progress instead; the next NetworkConnected event drains
+    -- it. Statistics live in the local statistics DB and can be synced on the
+    -- next connection.
+    if self.settings.auto_sync then
+        local doc_digest = self:getDocumentDigest()
+        if doc_digest then
+            KOSync2Queue:push({
+                document = doc_digest,
+                progress = self:getLastProgress(),
+                percentage = self:getLastPercent(),
+                device = self.settings.kosync_hostname or Device.model,
+                device_id = self.device_id,
+            })
+        end
+    end
 end
 
 function KOSync2:schedulePeriodicPush()
@@ -960,8 +1041,55 @@ function KOSync2:_onNetworkConnected()
     logger.dbg("KOSync2: onNetworkConnected")
     UIManager:scheduleIn(0.5, function()
         -- Network is supposed to be on already, don't wrap this in willRerunWhenOnline
-        self:getProgress(false, false)
+        self:drainQueue(function()
+            -- Pull only after queued uploads have completed.
+            self:getProgress(false, false)
+            if self.settings.auto_sync_stats then
+                self:syncStatistics()
+            end
+        end)
     end)
+end
+
+function KOSync2:drainQueue(done_func)
+    if KOSync2Queue:count() == 0 then
+        if done_func then done_func() end
+        return
+    end
+
+    local KOSync2Client = require("KOSync2Client")
+    local client = KOSync2Client:new{
+        custom_url = self.settings.custom_server,
+        service_spec = self.path .. "/api.json"
+    }
+
+    KOSync2Queue:drain(function(item, callback)
+        -- Pull the current server record first. If another device wrote a newer
+        -- position after this item was queued, replaying it would move the
+        -- server backwards.
+        client.get_progress(
+            self.settings.username,
+            self.settings.userkey,
+            item.document,
+            function(get_ok, body)
+                if get_ok and body and body.timestamp and item.queued_at
+                    and body.timestamp > item.queued_at + QUEUE_STALE_TOLERANCE then
+                    logger.dbg("KOSync2Queue: dropping stale queued progress for", item.document)
+                    KOSync2Queue:remove(item)
+                    callback(true)
+                    return
+                end
+                client.update_progress(
+                    self.settings.username,
+                    self.settings.userkey,
+                    item.document,
+                    item.progress,
+                    item.percentage,
+                    item.device,
+                    item.device_id,
+                    callback)
+            end)
+    end, done_func)
 end
 
 function KOSync2:_onNetworkDisconnecting()
