@@ -58,6 +58,9 @@ local API_CALL_DEBOUNCE_DELAY = time.s(25)
 -- tolerance absorbs small clock differences between the device and the server.
 local QUEUE_STALE_TOLERANCE = 5 * 60
 local COEXISTENCE_WARNED_KEY = "kosync2_coexist_warned"
+local SERVER_OFFSET_KEY = "kosync2_server_offset"
+local SERVER_OFFSET_AT_KEY = "kosync2_server_offset_at"
+local SERVER_OFFSET_MAX_AGE = 7 * 24 * 3600
 
 -- These failures will not succeed on retry, so keeping them in the queue would
 -- block every later item.
@@ -93,7 +96,14 @@ function KOSync2:init()
     self.last_page_turn_timestamp = 0
     self.periodic_push_scheduled = false
     self.account_generation = 0
+    self.queue_retry_task = nil
     self.server_time_offset = nil
+    local offset = G_reader_settings:readSetting(SERVER_OFFSET_KEY)
+    local offset_at = G_reader_settings:readSetting(SERVER_OFFSET_AT_KEY)
+    if type(offset) == "number" and type(offset_at) == "number"
+        and os.time() - offset_at <= SERVER_OFFSET_MAX_AGE then
+        self.server_time_offset = offset
+    end
 
     -- Like AutoSuspend, we need an instance-specific task for scheduling/resource management reasons.
     self.periodic_push_task = function()
@@ -190,6 +200,35 @@ function KOSync2:isBuiltinKOSyncEnabled()
     local disabled = G_reader_settings:readSetting("plugins_disabled", {})
     if type(disabled) ~= "table" then return true end
     return not disabled["kosync"]
+end
+
+function KOSync2:rememberServerTimeOffset(offset)
+    self.server_time_offset = offset
+    G_reader_settings:saveSetting(SERVER_OFFSET_KEY, offset)
+    G_reader_settings:saveSetting(SERVER_OFFSET_AT_KEY, os.time())
+end
+
+function KOSync2:resetServerTimeOffset()
+    self.server_time_offset = nil
+    G_reader_settings:delSetting(SERVER_OFFSET_KEY)
+    G_reader_settings:delSetting(SERVER_OFFSET_AT_KEY)
+end
+
+function KOSync2:hasQueuedProgressForCurrentDocument()
+    local doc_digest = self:getDocumentDigest()
+    if not doc_digest then return false end
+    return KOSync2Queue:hasDocument(doc_digest)
+end
+
+function KOSync2:scheduleQueueRetry()
+    if self.queue_retry_task then
+        UIManager:unschedule(self.queue_retry_task)
+    end
+    self.queue_retry_task = function()
+        self.queue_retry_task = nil
+        self:drainQueue()
+    end
+    UIManager:scheduleIn(30, self.queue_retry_task)
 end
 
 function KOSync2:maybeWarnAboutCoexistence()
@@ -525,6 +564,7 @@ end
 function KOSync2:setCustomServer(server)
     logger.dbg("KOSync2: Setting custom server to:", server)
     self.settings.custom_server = server ~= "" and server or nil
+    self:resetServerTimeOffset()
 end
 
 function KOSync2:setSyncForward(strategy)
@@ -647,6 +687,7 @@ function KOSync2:doRegister(username, password, menu)
         self.settings.username = username
         self.settings.userkey = userkey
         self.account_generation = self.account_generation + 1
+        self:resetServerTimeOffset()
         if menu then
             menu:updateItems()
         end
@@ -690,6 +731,7 @@ function KOSync2:doLogin(username, password, menu)
         self.settings.username = username
         self.settings.userkey = userkey
         self.account_generation = self.account_generation + 1
+        self:resetServerTimeOffset()
         if menu then
             menu:updateItems()
         end
@@ -708,6 +750,7 @@ function KOSync2:logout(menu)
     self.settings.userkey = nil
     self.settings.auto_sync = true
     self.account_generation = self.account_generation + 1
+    self:resetServerTimeOffset()
     -- Never replay queued progress from the previous account.
     KOSync2Queue:clear()
     if menu then
@@ -840,7 +883,7 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
             logger.dbg("KOSync2: ok:", ok, "status:", status, "body:", body)
             if ok then
                 if type(body) == "table" and tonumber(body.timestamp) then
-                    self.server_time_offset = tonumber(body.timestamp) - os.time()
+                    self:rememberServerTimeOffset(tonumber(body.timestamp) - os.time())
                 end
                 -- A successful push supersedes queued snapshots from before it
                 -- started. Items queued later may carry newer local progress.
@@ -858,6 +901,9 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
                     logger.warn("KOSync2: dropping progress push with permanent status", status)
                 elseif doc_digest then
                     KOSync2Queue:push(queue_item)
+                    if NetworkMgr:isOnline() then
+                        self:scheduleQueueRetry()
+                    end
                 end
                 if interactive then showSyncError() end
             end
@@ -868,6 +914,9 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         -- Network unreachable: queue for retry.
         if doc_digest then
             KOSync2Queue:push(queue_item)
+            if NetworkMgr:isOnline() then
+                self:scheduleQueueRetry()
+            end
         end
     else
         -- This is solely for onSuspend's sake, to clear the ghosting left by the "Connected" InfoMessage
@@ -1117,9 +1166,10 @@ function KOSync2:_onNetworkConnected()
     UIManager:scheduleIn(0.5, function()
         -- Network is supposed to be on already, don't wrap this in willRerunWhenOnline
         self:drainQueue(function()
-            -- Pull only after the queue is empty, otherwise a stale snapshot
-            -- could still overwrite the server after the pull.
-            if self.settings.auto_sync and KOSync2Queue:count() == 0 then
+            -- Pull only after the current document has no pending snapshot,
+            -- otherwise a stale snapshot could overwrite the server after the
+            -- pull. Other documents' pending items must not block this pull.
+            if self.settings.auto_sync and not self:hasQueuedProgressForCurrentDocument() then
                 self:getProgress(false, false)
             end
             if self.settings.auto_sync and self.settings.auto_sync_stats then
@@ -1132,7 +1182,7 @@ end
 function KOSync2:pullAfterQueue(ensure_networking, interactive)
     if NetworkMgr:isOnline() then
         self:drainQueue(function()
-            if KOSync2Queue:count() == 0 then
+            if not self:hasQueuedProgressForCurrentDocument() then
                 self:getProgress(false, interactive)
             end
         end)
@@ -1211,10 +1261,13 @@ function KOSync2:drainQueue(done_func)
                         item.percentage,
                         item.device,
                         item.device_id,
-                        function(update_ok, status)
+                        function(update_ok, status, body)
                             if not stillCurrent() then
                                 callback(false)
                                 return
+                            end
+                            if update_ok and type(body) == "table" and tonumber(body.timestamp) then
+                                self:rememberServerTimeOffset(tonumber(body.timestamp) - os.time())
                             end
                             if not update_ok and status and PERMANENT_FAILURE_STATUSES[status] then
                                 logger.warn("KOSync2Queue: dropping queued item with permanent status", status)
@@ -1307,6 +1360,10 @@ end
 function KOSync2:onCloseWidget()
     UIManager:unschedule(self.periodic_push_task)
     self.periodic_push_task = nil
+    if self.queue_retry_task then
+        UIManager:unschedule(self.queue_retry_task)
+        self.queue_retry_task = nil
+    end
 end
 
 function KOSync2:getLoadedStatisticsPlugin()

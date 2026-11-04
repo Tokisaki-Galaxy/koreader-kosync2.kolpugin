@@ -101,6 +101,8 @@ assert(Queue:count() == 0, "remove exact clears")
 
 Queue:push({ document = "d", progress = "1", percentage = 0.01 })
 local entry = Queue:load()[1]
+assert(Queue:hasDocument("d"), "hasDocument finds an entry")
+assert(not Queue:hasDocument("missing"), "hasDocument ignores absent entries")
 Queue:removeDocumentBefore("d", entry.queued_at - 1)
 assert(Queue:count() == 1, "removeDocumentBefore keeps newer entries")
 Queue:removeDocumentBefore("d", entry.queued_at)
