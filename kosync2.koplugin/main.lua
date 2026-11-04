@@ -61,6 +61,7 @@ local COEXISTENCE_WARNED_KEY = "kosync2_coexist_warned"
 local SERVER_OFFSET_KEY = "kosync2_server_offset"
 local SERVER_OFFSET_AT_KEY = "kosync2_server_offset_at"
 local SERVER_OFFSET_MAX_AGE = 7 * 24 * 3600
+local MAX_SERVER_OFFSET = 24 * 3600
 
 -- These failures will not succeed on retry, so keeping them in the queue would
 -- block every later item.
@@ -101,8 +102,8 @@ function KOSync2:init()
     self.server_time_offset = nil
     local offset = G_reader_settings:readSetting(SERVER_OFFSET_KEY)
     local offset_at = G_reader_settings:readSetting(SERVER_OFFSET_AT_KEY)
-    if type(offset) == "number" and type(offset_at) == "number"
-        and os.time() - offset_at <= SERVER_OFFSET_MAX_AGE then
+    if type(offset) == "number" and math.abs(offset) <= MAX_SERVER_OFFSET
+        and type(offset_at) == "number" and os.time() - offset_at <= SERVER_OFFSET_MAX_AGE then
         self.server_time_offset = offset
     end
 
@@ -204,6 +205,10 @@ function KOSync2:isBuiltinKOSyncEnabled()
 end
 
 function KOSync2:rememberServerTimeOffset(offset)
+    if type(offset) ~= "number" or offset ~= offset or math.abs(offset) > MAX_SERVER_OFFSET then
+        logger.warn("KOSync2: ignoring implausible server clock offset:", offset)
+        return
+    end
     self.server_time_offset = offset
     G_reader_settings:saveSetting(SERVER_OFFSET_KEY, offset)
     G_reader_settings:saveSetting(SERVER_OFFSET_AT_KEY, os.time())
@@ -566,8 +571,14 @@ end
 
 function KOSync2:setCustomServer(server)
     logger.dbg("KOSync2: Setting custom server to:", server)
+    local previous = self.settings.custom_server
     self.settings.custom_server = server ~= "" and server or nil
-    self:resetServerTimeOffset()
+    if previous ~= self.settings.custom_server then
+        self:resetServerTimeOffset()
+        -- Queued progress belongs to the previous server. Legacy entries have
+        -- no server tag, so clear the whole queue on an actual server change.
+        KOSync2Queue:clear()
+    end
 end
 
 function KOSync2:setSyncForward(strategy)
