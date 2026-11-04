@@ -59,6 +59,16 @@ local API_CALL_DEBOUNCE_DELAY = time.s(25)
 local QUEUE_STALE_TOLERANCE = 5 * 60
 local COEXISTENCE_WARNED_KEY = "kosync2_coexist_warned"
 
+-- These failures will not succeed on retry, so keeping them in the queue would
+-- block every later item.
+local PERMANENT_FAILURE_STATUSES = {
+    [400] = true,
+    [403] = true,
+    [404] = true,
+    [413] = true,
+    [422] = true,
+}
+
 -- NOTE: This is used in a migration script by ui/data/onetime_migration,
 --       which is why it's public.
 KOSync2.default_settings = {
@@ -82,6 +92,8 @@ function KOSync2:init()
     self.last_page = -1
     self.last_page_turn_timestamp = 0
     self.periodic_push_scheduled = false
+    self.account_generation = 0
+    self.server_time_offset = nil
 
     -- Like AutoSuspend, we need an instance-specific task for scheduling/resource management reasons.
     self.periodic_push_task = function()
@@ -176,6 +188,7 @@ end
 
 function KOSync2:isBuiltinKOSyncEnabled()
     local disabled = G_reader_settings:readSetting("plugins_disabled", {})
+    if type(disabled) ~= "table" then return true end
     return not disabled["kosync"]
 end
 
@@ -219,7 +232,11 @@ end
 function KOSync2:onReaderReady()
     if self.settings.auto_sync then
         UIManager:nextTick(function()
-            self:getProgress(true, false)
+            self:pullAfterQueue(true, false)
+        end)
+    elseif KOSync2Queue:count() > 0 then
+        UIManager:nextTick(function()
+            self:drainQueue()
         end)
     end
     -- NOTE: Keep in mind that, on Android, turning on WiFi requires a focus switch, which will trip a Suspend/Resume pair.
@@ -629,6 +646,7 @@ function KOSync2:doRegister(username, password, menu)
         end
         self.settings.username = username
         self.settings.userkey = userkey
+        self.account_generation = self.account_generation + 1
         if menu then
             menu:updateItems()
         end
@@ -671,6 +689,7 @@ function KOSync2:doLogin(username, password, menu)
         end
         self.settings.username = username
         self.settings.userkey = userkey
+        self.account_generation = self.account_generation + 1
         if menu then
             menu:updateItems()
         end
@@ -688,6 +707,7 @@ end
 function KOSync2:logout(menu)
     self.settings.userkey = nil
     self.settings.auto_sync = true
+    self.account_generation = self.account_generation + 1
     -- Never replay queued progress from the previous account.
     KOSync2Queue:clear()
     if menu then
@@ -783,6 +803,8 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         custom_url = self.settings.custom_server,
         service_spec = self.path .. "/api.json"
     }
+    local push_started_at = os.time()
+    local account_generation = self.account_generation
     local doc_digest = self:getDocumentDigest()
     local metadata = self:getMetadata()
     local progress = self:getLastProgress()
@@ -795,6 +817,8 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         percentage = percentage,
         device = chosen_device_name,
         device_id = self.device_id,
+        username = self.settings.username,
+        server = self.settings.custom_server,
     }
     local ok, err = pcall(client.update_progress,
         client,
@@ -807,11 +831,20 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         chosen_device_name,
         self.device_id,
         function(ok, status, body)
-            logger.dbg("KOSync2: [Push] progress to", percentage * 100, "% =>", progress, "for", self.view.document.file)
+            if account_generation ~= self.account_generation then
+                logger.dbg("KOSync2: ignoring push result after account change")
+                return
+            end
+            local doc_path = self.view and self.view.document and self.view.document.file or "unknown"
+            logger.dbg("KOSync2: [Push] progress to", percentage * 100, "% =>", progress, "for", doc_path)
             logger.dbg("KOSync2: ok:", ok, "status:", status, "body:", body)
             if ok then
-                -- A successful push supersedes any older queued snapshot.
-                KOSync2Queue:removeDocument(doc_digest)
+                if type(body) == "table" and tonumber(body.timestamp) then
+                    self.server_time_offset = tonumber(body.timestamp) - os.time()
+                end
+                -- A successful push supersedes queued snapshots from before it
+                -- started. Items queued later may carry newer local progress.
+                KOSync2Queue:removeDocumentBefore(doc_digest, push_started_at)
                 if interactive then
                     UIManager:show(InfoMessage:new{
                         text = _("Progress has been pushed."),
@@ -819,8 +852,11 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
                     })
                 end
             else
-                -- Do not retry auth failures: the credentials are the problem.
-                if status ~= 401 and doc_digest then
+                if status == 401 then
+                    -- Auth failures are not retryable with the current credentials.
+                elseif status and PERMANENT_FAILURE_STATUSES[status] then
+                    logger.warn("KOSync2: dropping progress push with permanent status", status)
+                elseif doc_digest then
                     KOSync2Queue:push(queue_item)
                 end
                 if interactive then showSyncError() end
@@ -1012,7 +1048,7 @@ function KOSync2:_onCloseDocument()
     -- down. Queue the progress instead; the next NetworkConnected event drains
     -- it. Statistics live in the local statistics DB and can be synced on the
     -- next connection.
-    if self.settings.auto_sync then
+    if self.settings.auto_sync and self.settings.userkey then
         local doc_digest = self:getDocumentDigest()
         if doc_digest then
             KOSync2Queue:push({
@@ -1022,6 +1058,8 @@ function KOSync2:_onCloseDocument()
                 percentage = self:getLastPercent(),
                 device = self.settings.kosync_hostname or Device.model,
                 device_id = self.device_id,
+                username = self.settings.username,
+                server = self.settings.custom_server,
             })
         end
     end
@@ -1061,7 +1099,7 @@ function KOSync2:_onResume()
     -- And if we don't, this *will* (attempt to) trigger a connection and as such a NetworkConnected event,
     -- but only a single pull will happen, since getProgress debounces itself.
     UIManager:scheduleIn(1, function()
-        self:getProgress(true, false)
+        self:pullAfterQueue(true, false)
     end)
 end
 
@@ -1073,16 +1111,34 @@ end
 
 function KOSync2:_onNetworkConnected()
     logger.dbg("KOSync2: onNetworkConnected")
+    if not self.settings.auto_sync and KOSync2Queue:count() == 0 then
+        return
+    end
     UIManager:scheduleIn(0.5, function()
         -- Network is supposed to be on already, don't wrap this in willRerunWhenOnline
         self:drainQueue(function()
-            -- Pull only after queued uploads have completed.
-            self:getProgress(false, false)
-            if self.settings.auto_sync_stats then
+            -- Pull only after the queue is empty, otherwise a stale snapshot
+            -- could still overwrite the server after the pull.
+            if self.settings.auto_sync and KOSync2Queue:count() == 0 then
+                self:getProgress(false, false)
+            end
+            if self.settings.auto_sync and self.settings.auto_sync_stats then
                 self:syncStatistics()
             end
         end)
     end)
+end
+
+function KOSync2:pullAfterQueue(ensure_networking, interactive)
+    if NetworkMgr:isOnline() then
+        self:drainQueue(function()
+            if KOSync2Queue:count() == 0 then
+                self:getProgress(false, interactive)
+            end
+        end)
+    else
+        self:getProgress(ensure_networking, interactive)
+    end
 end
 
 function KOSync2:drainQueue(done_func)
@@ -1091,46 +1147,98 @@ function KOSync2:drainQueue(done_func)
         return
     end
 
+    local username = self.settings.username
+    local userkey = self.settings.userkey
+    local custom_url = self.settings.custom_server
+    local generation = self.account_generation
+    if not username or not userkey then
+        if done_func then done_func() end
+        return
+    end
+
     local KOSync2Client = require("KOSync2Client")
     local client = KOSync2Client:new{
-        custom_url = self.settings.custom_server,
+        custom_url = custom_url,
         service_spec = self.path .. "/api.json"
     }
 
+    local function stillCurrent()
+        return generation == self.account_generation
+    end
+
     KOSync2Queue:drain(function(item, callback)
+        if item.username ~= username or item.server ~= custom_url then
+            logger.dbg("KOSync2Queue: dropping queued item from another account or server")
+            KOSync2Queue:remove(item)
+            callback(true)
+            return
+        end
+
         -- Pull the current server record first. If another device wrote a newer
         -- position after this item was queued, replaying it would move the
         -- server backwards.
         client.get_progress(
-            self.settings.username,
-            self.settings.userkey,
+            username,
+            userkey,
             item.document,
             function(get_ok, body)
-                if get_ok and body and body.timestamp and item.queued_at
-                    and body.timestamp > item.queued_at + QUEUE_STALE_TOLERANCE then
-                    logger.dbg("KOSync2Queue: dropping stale queued progress for", item.document)
-                    KOSync2Queue:remove(item)
-                    callback(true)
-                    return
+                local ok, err = pcall(function()
+                    if not stillCurrent() then
+                        callback(false)
+                        return
+                    end
+
+                    local server_timestamp = get_ok and body and tonumber(body.timestamp) or nil
+                    local offset = self.server_time_offset
+                    -- Only compare clocks when a successful push has given us a
+                    -- server offset. Without one, sending the item is safer than
+                    -- silently dropping it because the device clock is wrong.
+                    if offset and server_timestamp and item.queued_at then
+                        if server_timestamp > item.queued_at + offset + QUEUE_STALE_TOLERANCE then
+                            logger.dbg("KOSync2Queue: dropping stale queued progress for", item.document)
+                            KOSync2Queue:remove(item)
+                            callback(true)
+                            return
+                        end
+                    end
+
+                    client.update_progress(
+                        username,
+                        userkey,
+                        item.document,
+                        item.metadata,
+                        item.progress,
+                        item.percentage,
+                        item.device,
+                        item.device_id,
+                        function(update_ok, status)
+                            if not stillCurrent() then
+                                callback(false)
+                                return
+                            end
+                            if not update_ok and status and PERMANENT_FAILURE_STATUSES[status] then
+                                logger.warn("KOSync2Queue: dropping queued item with permanent status", status)
+                                KOSync2Queue:remove(item)
+                                callback(true)
+                                return
+                            end
+                            callback(update_ok)
+                        end)
+                end)
+                if not ok then
+                    logger.warn("KOSync2Queue: drain callback failed:", err)
+                    callback(false)
                 end
-                client.update_progress(
-                    self.settings.username,
-                    self.settings.userkey,
-                    item.document,
-                    item.metadata,
-                    item.progress,
-                    item.percentage,
-                    item.device,
-                    item.device_id,
-                    callback)
             end)
     end, done_func)
 end
 
 function KOSync2:_onNetworkDisconnecting()
     logger.dbg("KOSync2: onNetworkDisconnecting")
-    -- Network is supposed to be on already, don't wrap this in willRerunWhenOnline
-    self:updateProgress(false, false)
+    if self.settings.auto_sync then
+        -- Network is supposed to be on already, don't wrap this in willRerunWhenOnline
+        self:updateProgress(false, false)
+    end
 end
 
 function KOSync2:onKOSync2PushProgress()
@@ -1179,17 +1287,19 @@ function KOSync2:registerEvents()
         self.onCloseDocument = nil
     end
 
+    -- Always listen for a connection: a failed manual push may have queued
+    -- progress even when auto-sync is off.
+    self.onNetworkConnected = self._onNetworkConnected
+
     if self.settings.auto_sync then
         self.onPageUpdate = self._onPageUpdate
         self.onResume = self._onResume
         self.onSuspend = self._onSuspend
-        self.onNetworkConnected = self._onNetworkConnected
         self.onNetworkDisconnecting = self._onNetworkDisconnecting
     else
         self.onPageUpdate = nil
         self.onResume = nil
         self.onSuspend = nil
-        self.onNetworkConnected = nil
         self.onNetworkDisconnecting = nil
     end
 end

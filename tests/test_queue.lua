@@ -99,4 +99,30 @@ local item = Queue:load()[1]
 assert(Queue:remove(item), "remove exact")
 assert(Queue:count() == 0, "remove exact clears")
 
+Queue:push({ document = "d", progress = "1", percentage = 0.01 })
+local entry = Queue:load()[1]
+Queue:removeDocumentBefore("d", entry.queued_at - 1)
+assert(Queue:count() == 1, "removeDocumentBefore keeps newer entries")
+Queue:removeDocumentBefore("d", entry.queued_at)
+assert(Queue:count() == 0, "removeDocumentBefore removes older entries")
+
+Queue:clear()
+Queue:push({ document = "e", progress = "1", percentage = 0.01 })
+local pending_cb
+local first_done = false
+local second_done = false
+Queue:drain(function(_, cb)
+    pending_cb = cb
+end, function()
+    first_done = true
+end)
+Queue:drain(function(_, cb)
+    cb(true)
+end, function()
+    second_done = true
+end)
+pending_cb(true)
+assert(first_done and second_done, "reentrant done functions both run")
+assert(Queue:count() == 0, "reentrant drain clears")
+
 print("KOSync2Queue tests passed")

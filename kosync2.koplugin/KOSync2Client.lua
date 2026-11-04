@@ -6,6 +6,13 @@ local PROGRESS_TIMEOUTS = { 2, 5 }
 local SYNC_TIMEOUTS = { 10, 45 }
 local AUTH_TIMEOUTS = { 5, 10 }
 
+local function safeCallback(callback, ...)
+    local ok, err = pcall(callback, ...)
+    if not ok then
+        logger.warn("KOSync2Client: callback failed:", err)
+    end
+end
+
 local KOSync2Client = {
     service_spec = nil,
     custom_url = nil,
@@ -55,9 +62,10 @@ function KOSync2Client:init()
                 end
             end,
         }, function(res)
+            res = res or {}
+            res.status = res.code
             result = res
-            result.status = res.code
-            coroutine.resume(args.thread)
+            if args.thread then coroutine.resume(args.thread) end
         end)
         return coroutine.create(function() coroutine.yield(result) end)
     end
@@ -120,11 +128,11 @@ function KOSync2Client:sync_statistics(username, userkey, payload, callback)
             return self.client:sync_statistics(payload)
         end)
         if ok then
-            callback(res.status == 200 or res.status == 202, res.body, res.status)
+            safeCallback(callback, res.status == 200 or res.status == 202, res.body, res.status)
         else
             logger.warn("KOSync2Client:sync_statistics failure:", res)
             local error_body = type(res) == "table" and res.body or nil
-            callback(false, error_body, nil)
+            safeCallback(callback, false, error_body, nil)
         end
     end)
     self.client:enable("KOSync2AsyncHTTP", {thread = co})
@@ -164,10 +172,10 @@ function KOSync2Client:update_progress(
             })
         end)
         if ok then
-            callback(res.status == 200, res.status, res.body)
+            safeCallback(callback, res.status == 200, res.status, res.body)
         else
             logger.warn("KOSync2Client:update_progress failure:", res)
-            callback(false, nil, res.body)
+            safeCallback(callback, false, nil, res.body)
         end
     end)
     self.client:enable("KOSync2AsyncHTTP", {thread = co})
@@ -196,10 +204,10 @@ function KOSync2Client:get_progress(
             })
         end)
         if ok then
-            callback(res.status == 200, res.body)
+            safeCallback(callback, res.status == 200, res.body)
         else
             logger.warn("KOSync2Client:get_progress failure:", res)
-            callback(false, res.body)
+            safeCallback(callback, false, res.body)
         end
     end)
     self.client:enable("KOSync2AsyncHTTP", {thread = co})
