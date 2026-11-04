@@ -873,7 +873,7 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         progress = progress,
         percentage = percentage,
         device = chosen_device_name,
-        device_id = self.device_id,
+        device_id = self.device_id or "",
         username = self.settings.username,
         server = self.settings.custom_server,
         server_set = true,
@@ -887,7 +887,7 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         progress,
         percentage,
         chosen_device_name,
-        self.device_id,
+        self.device_id or "",
         function(ok, status, body)
             if account_generation ~= self.account_generation then
                 logger.dbg("KOSync2: ignoring push result after account change")
@@ -1121,7 +1121,7 @@ function KOSync2:_onCloseDocument()
                 progress = self:getLastProgress(),
                 percentage = self:getLastPercent(),
                 device = self.settings.kosync_hostname or Device.model,
-                device_id = self.device_id,
+                device_id = self.device_id or "",
                 username = self.settings.username,
                 server = self.settings.custom_server,
                 server_set = true,
