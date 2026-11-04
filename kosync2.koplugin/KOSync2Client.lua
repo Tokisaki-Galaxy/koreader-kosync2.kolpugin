@@ -137,6 +137,7 @@ function KOSync2Client:update_progress(
         username,
         password,
         document,
+        metadata,
         progress,
         percentage,
         device,
@@ -155,6 +156,7 @@ function KOSync2Client:update_progress(
         local ok, res = pcall(function()
             return self.client:update_progress({
                 document = document,
+                metadata = metadata,
                 progress = tostring(progress),
                 percentage = percentage,
                 device = device,
