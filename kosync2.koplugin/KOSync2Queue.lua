@@ -99,7 +99,7 @@ function KOSync2Queue:removeDocumentBefore(document, before_queued_at)
     local filtered = {}
     local removed = 0
     for _, entry in ipairs(queue) do
-        if entry.document == document and (entry.queued_at or 0) <= before_queued_at then
+        if entry.document == document and (entry.queued_at or 0) < before_queued_at then
             removed = removed + 1
         else
             table.insert(filtered, entry)

@@ -97,6 +97,7 @@ function KOSync2:init()
     self.periodic_push_scheduled = false
     self.account_generation = 0
     self.queue_retry_task = nil
+    self.closed = false
     self.server_time_offset = nil
     local offset = G_reader_settings:readSetting(SERVER_OFFSET_KEY)
     local offset_at = G_reader_settings:readSetting(SERVER_OFFSET_AT_KEY)
@@ -221,11 +222,13 @@ function KOSync2:hasQueuedProgressForCurrentDocument()
 end
 
 function KOSync2:scheduleQueueRetry()
+    if self.closed then return end
     if self.queue_retry_task then
         UIManager:unschedule(self.queue_retry_task)
     end
     self.queue_retry_task = function()
         self.queue_retry_task = nil
+        if self.closed then return end
         self:drainQueue()
     end
     UIManager:scheduleIn(30, self.queue_retry_task)
@@ -862,6 +865,7 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         device_id = self.device_id,
         username = self.settings.username,
         server = self.settings.custom_server,
+        server_set = true,
     }
     local ok, err = pcall(client.update_progress,
         client,
@@ -1032,7 +1036,7 @@ function KOSync2:getProgress(ensure_networking, interactive)
 
             local self_older
             if body.timestamp ~= nil then
-                self_older = (body.timestamp > self.last_page_turn_timestamp)
+                self_older = (body.timestamp > self.last_page_turn_timestamp + (self.server_time_offset or 0))
             else
                 -- If we are working with an old sync server, we can only use the percentage field.
                 self_older = (body.percentage > percentage)
@@ -1109,6 +1113,7 @@ function KOSync2:_onCloseDocument()
                 device_id = self.device_id,
                 username = self.settings.username,
                 server = self.settings.custom_server,
+                server_set = true,
             })
         end
     end
@@ -1217,7 +1222,9 @@ function KOSync2:drainQueue(done_func)
     end
 
     KOSync2Queue:drain(function(item, callback)
-        if item.username ~= username or item.server ~= custom_url then
+        local wrong_account = item.username ~= nil and item.username ~= username
+        local wrong_server = item.server_set and item.server ~= custom_url
+        if wrong_account or wrong_server then
             logger.dbg("KOSync2Queue: dropping queued item from another account or server")
             KOSync2Queue:remove(item)
             callback(true)
@@ -1358,6 +1365,7 @@ function KOSync2:registerEvents()
 end
 
 function KOSync2:onCloseWidget()
+    self.closed = true
     UIManager:unschedule(self.periodic_push_task)
     self.periodic_push_task = nil
     if self.queue_retry_task then
