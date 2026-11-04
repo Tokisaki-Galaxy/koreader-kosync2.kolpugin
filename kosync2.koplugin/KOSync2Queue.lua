@@ -3,15 +3,19 @@ local Persist = require("persist")
 local logger = require("logger")
 local util = require("util")
 
+local has_ui, UIManager = pcall(require, "ui/uimanager")
+
 -- Keep this separate from the built-in KOSync queue. KOReader puts every
 -- plugin directory on package.path, so sharing either the module name or the
 -- queue file would make both plugins read and write the same pending items.
 local QUEUE_PATH = DataStorage:getSettingsDir() .. "/kosync2_queue.lua"
 local MAX_AGE = 28 * 24 * 3600 -- 4 weeks in seconds
 local MAX_ENTRIES = 200 -- paranoia cap
+local DRAIN_TIMEOUT = 60 -- seconds
 
 local KOSync2Queue = {
     _draining = nil,
+    _pending_done = {},
 }
 
 function KOSync2Queue:_storage()
@@ -86,15 +90,16 @@ function KOSync2Queue:remove(item)
     return false
 end
 
---- Drop every queued entry for a document.
--- Called after a successful push so an older queued snapshot can never
--- overwrite the progress we just uploaded.
-function KOSync2Queue:removeDocument(document)
+--- Drop queued entries for a document that are older than the given timestamp.
+-- Called after a successful push so a queued snapshot that was already
+-- superseded cannot overwrite the progress we just uploaded. Entries queued
+-- later than the push started are kept: they may carry newer local progress.
+function KOSync2Queue:removeDocumentBefore(document, before_queued_at)
     local queue = self:load()
     local filtered = {}
     local removed = 0
     for _, entry in ipairs(queue) do
-        if entry.document == document then
+        if entry.document == document and (entry.queued_at or 0) < before_queued_at then
             removed = removed + 1
         else
             table.insert(filtered, entry)
@@ -106,31 +111,50 @@ function KOSync2Queue:removeDocument(document)
     end
 end
 
+function KOSync2Queue:removeDocument(document)
+    self:removeDocumentBefore(document, math.huge)
+end
+
 --- Attempt to send all queued items in order, stopping on the first failure.
 -- @param send_func function(item, callback): reports success through callback(bool)
 -- @param done_func optional function(sent): called when the drain finishes
 function KOSync2Queue:drain(send_func, done_func)
     -- Network events may arrive while an asynchronous request is still in flight.
-    if self._draining then return end
+    if self._draining then
+        if done_func then
+            table.insert(self._pending_done, done_func)
+        end
+        return
+    end
     local queue = self:load()
     if #queue == 0 then
         if done_func then done_func(0) end
         return
     end
     self._draining = true
+    self._pending_done = {}
 
     logger.info("KOSync2Queue: draining", #queue, "queued items")
     local sent = 0
     local settled = false
+    local watchdog_action
 
     -- Both failure and queue exhaustion complete the drain exactly once.
     local function settle()
         if settled then return end
         settled = true
         self._draining = nil
+        if watchdog_action and has_ui and UIManager.unschedule then
+            UIManager:unschedule(watchdog_action)
+        end
         local ok, remaining = pcall(self.count, self)
         logger.info("KOSync2Queue: sent", sent, ", remaining", ok and remaining or "unknown")
-        if done_func then done_func(sent) end
+        local pending = self._pending_done
+        self._pending_done = {}
+        if done_func then pcall(done_func, sent) end
+        for _, fn in ipairs(pending) do
+            pcall(fn, sent)
+        end
     end
 
     local function fail(err)
@@ -138,6 +162,22 @@ function KOSync2Queue:drain(send_func, done_func)
             logger.warn("KOSync2Queue: drain failed:", err)
         end
         settle()
+    end
+
+    -- An asynchronous HTTP callback can be lost by a broken custom server.
+    -- Do not let that leave _draining stuck forever. The timer is reset for
+    -- every item, so a long queue is not judged against a single budget.
+    local function armWatchdog()
+        if not (has_ui and UIManager.scheduleIn) then return end
+        if watchdog_action and UIManager.unschedule then
+            UIManager:unschedule(watchdog_action)
+        end
+        watchdog_action = function()
+            if settled then return end
+            logger.warn("KOSync2Queue: drain timed out")
+            fail("timeout")
+        end
+        UIManager:scheduleIn(DRAIN_TIMEOUT, watchdog_action)
     end
 
     local function findItem(current, item)
@@ -150,6 +190,7 @@ function KOSync2Queue:drain(send_func, done_func)
 
     local function sendNext(i)
         if settled then return end
+        armWatchdog()
         local item = queue[i]
         if not item then
             settle()
@@ -198,6 +239,16 @@ function KOSync2Queue:drain(send_func, done_func)
     end
 
     sendNext(1)
+end
+
+function KOSync2Queue:hasDocument(document)
+    if not document then return false end
+    for _, entry in ipairs(self:load()) do
+        if entry.document == document then
+            return true
+        end
+    end
+    return false
 end
 
 function KOSync2Queue:count()
