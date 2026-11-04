@@ -62,12 +62,13 @@ end
 local Queue = dofile("kosync2.koplugin/KOSync2Queue.lua")
 
 Queue:clear()
-Queue:push({ document = "a", progress = "10", percentage = 0.1 })
+Queue:push({ document = "a", metadata = { title = "Book A" }, progress = "10", percentage = 0.1 })
 assert(Queue:count() == 1, "push count")
 
-Queue:push({ document = "a", progress = "20", percentage = 0.2 })
+Queue:push({ document = "a", metadata = { title = "Book A" }, progress = "20", percentage = 0.2 })
 assert(Queue:count() == 1, "same-day dedupe")
 assert(Queue:load()[1].progress == "20", "dedupe keeps newest")
+assert(Queue:load()[1].metadata.title == "Book A", "metadata survives queue")
 
 Queue:push({ document = "b", progress = "5", percentage = 0.05 })
 assert(Queue:count() == 2, "two documents")

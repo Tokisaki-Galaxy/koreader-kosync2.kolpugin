@@ -20,6 +20,7 @@
 *   **Server-Side Merging**: Uses intelligent logic to merge reading events from different devices, preventing data loss or overwrites common with file-based sync (like WebDAV).
 *   **E-ink Optimized**: Built with efficiency in mind. It uses lightweight JSON deltas instead of full database uploads to save battery and bandwidth.
 *   **Offline Retry Queue**: Failed progress pushes are kept on the device and replayed on the next connection instead of being lost when Wi-Fi is unavailable.
+*   **Optional Metadata**: Can send the document filename, title, and authors with each progress update for servers that store them. Off by default.
 *   **Non-Invasive Integration**: Utilizes `user-patching` to hook into the native "Reading Statistics" menu without modifying core KOReader files.
 
 ---

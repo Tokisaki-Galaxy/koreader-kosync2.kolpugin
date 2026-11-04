@@ -72,6 +72,7 @@ KOSync2.default_settings = {
     sync_backward = SYNC_STRATEGY.DISABLE,
     checksum_method = CHECKSUM_METHOD.BINARY,
     auto_sync_stats = false,
+    send_metadata = false,
 }
 
 function KOSync2:init()
@@ -462,6 +463,17 @@ If set to 0, updating progress based on page turns will be disabled.]]),
                 separator = true,
             },
             {
+                text = _("Send document metadata"),
+                checked_func = function()
+                    return self.settings.send_metadata
+                end,
+                help_text = _([[When enabled, the document filename, title, and authors are sent with progress updates. The official sync server ignores this data; custom servers may store it.]]),
+                callback = function()
+                    self.settings.send_metadata = not self.settings.send_metadata
+                end,
+                separator = true,
+            },
+            {
                 text = _("Statistics sync"),
                 sub_item_table = {
                     {
@@ -711,14 +723,32 @@ function KOSync2:getFileDigest()
     return self.ui.doc_settings:readSetting("partial_md5_checksum")
 end
 
-function KOSync2:getFileNameDigest()
+function KOSync2:getFileName()
     local file = self.ui.document.file
     if not file then return end
 
     local file_path, file_name = util.splitFilePathName(file) -- luacheck: no unused
     if not file_name then return end
 
+    return file_name
+end
+
+function KOSync2:getFileNameDigest()
+    local file_name = self:getFileName()
+    if not file_name then return end
+
     return md5(file_name)
+end
+
+function KOSync2:getMetadata()
+    if not self.settings.send_metadata then return end
+
+    local props = self.ui.doc_props
+    return {
+        filename = self:getFileName(),
+        title = props.display_title,
+        authors = props.authors,
+    }
 end
 
 function KOSync2:syncToProgress(progress)
@@ -754,11 +784,13 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         service_spec = self.path .. "/api.json"
     }
     local doc_digest = self:getDocumentDigest()
+    local metadata = self:getMetadata()
     local progress = self:getLastProgress()
     local percentage = self:getLastPercent()
     local chosen_device_name = self.settings.kosync_hostname or Device.model
     local queue_item = {
         document = doc_digest,
+        metadata = metadata,
         progress = progress,
         percentage = percentage,
         device = chosen_device_name,
@@ -769,6 +801,7 @@ function KOSync2:updateProgress(ensure_networking, interactive, on_suspend)
         self.settings.username,
         self.settings.userkey,
         doc_digest,
+        metadata,
         progress,
         percentage,
         chosen_device_name,
@@ -984,6 +1017,7 @@ function KOSync2:_onCloseDocument()
         if doc_digest then
             KOSync2Queue:push({
                 document = doc_digest,
+                metadata = self:getMetadata(),
                 progress = self:getLastProgress(),
                 percentage = self:getLastPercent(),
                 device = self.settings.kosync_hostname or Device.model,
@@ -1083,6 +1117,7 @@ function KOSync2:drainQueue(done_func)
                     self.settings.username,
                     self.settings.userkey,
                     item.document,
+                    item.metadata,
                     item.progress,
                     item.percentage,
                     item.device,
