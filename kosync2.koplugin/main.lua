@@ -201,8 +201,8 @@ function KOSync2:onDispatcherRegisterActions()
         { category="string", event="KOSync2ToggleAutoSync", title=title(_("Set auto progress sync")), reader=true,
         args={true, false}, toggle={_("on"), _("off")},})
     Dispatcher:registerAction("kosync2_toggle_autosync", { category="none", event="KOSync2ToggleAutoSync", title=title(_("Toggle auto progress sync")), reader=true,})
-    Dispatcher:registerAction("kosync2_push_progress", { category="none", event="KOSync2PushProgress", title=title(_("Push progress from this device")), reader=true,})
-    Dispatcher:registerAction("kosync2_pull_progress", { category="none", event="KOSync2PullProgress", title=title(_("Pull progress from other devices")), reader=true, separator=true,})
+    Dispatcher:registerAction("kosync2_push_progress", { category="none", event="KOSync2PushProgress", title=title(_("↑ Push progress")), reader=true,})
+    Dispatcher:registerAction("kosync2_pull_progress", { category="none", event="KOSync2PullProgress", title=title(_("↓ Pull progress")), reader=true, separator=true,})
 
     -- Keep old gesture bindings working when the built-in plugin is disabled.
     -- When it is enabled, those IDs belong to it and must not be stolen.
@@ -211,8 +211,8 @@ function KOSync2:onDispatcherRegisterActions()
             { category="string", event="KOSync2ToggleAutoSync", title=T(_("%1 (legacy)"), _("Set auto progress sync")), reader=true,
             args={true, false}, toggle={_("on"), _("off")},})
         Dispatcher:registerAction("kosync_toggle_autosync", { category="none", event="KOSync2ToggleAutoSync", title=T(_("%1 (legacy)"), _("Toggle auto progress sync")), reader=true,})
-        Dispatcher:registerAction("kosync_push_progress", { category="none", event="KOSync2PushProgress", title=T(_("%1 (legacy)"), _("Push progress from this device")), reader=true,})
-        Dispatcher:registerAction("kosync_pull_progress", { category="none", event="KOSync2PullProgress", title=T(_("%1 (legacy)"), _("Pull progress from other devices")), reader=true, separator=true,})
+        Dispatcher:registerAction("kosync_push_progress", { category="none", event="KOSync2PushProgress", title=T(_("%1 (legacy)"), _("↑ Push progress")), reader=true,})
+        Dispatcher:registerAction("kosync_pull_progress", { category="none", event="KOSync2PullProgress", title=T(_("%1 (legacy)"), _("↓ Pull progress")), reader=true, separator=true,})
     end
 end
 
@@ -420,7 +420,7 @@ If set to 0, updating progress based on page turns will be disabled.]]),
                 separator = true,
             },
             {
-                text = _("Push progress from this device now"),
+                text = _("↑ Push progress now"),
                 enabled_func = function()
                     return self.settings.userkey ~= nil
                 end,
@@ -429,7 +429,7 @@ If set to 0, updating progress based on page turns will be disabled.]]),
                 end,
             },
             {
-                text = _("Pull progress from other devices now"),
+                text = _("↓ Pull progress now"),
                 enabled_func = function()
                     return self.settings.userkey ~= nil
                 end,
